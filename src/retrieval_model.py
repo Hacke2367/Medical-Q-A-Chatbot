@@ -1,0 +1,384 @@
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import os
+import re
+import pickle
+from pathlib import Path
+from deep_translator import GoogleTranslator
+from langdetect import detect, DetectorFactory
+
+# Ensure consistent language detection
+DetectorFactory.seed = 0
+
+# Supported languages
+SUPPORTED_LANGUAGES = ['en', 'es', 'hi', 'fr']
+
+# Medical terms for language detection enhancement
+MEDICAL_TERMS = {
+    'en': ["symptom", "treatment", "diagnosis", "disease", "medicine",
+           "fever", "pain", "blood pressure", "hypertension", "diabetes"],
+    'es': ["síntoma", "tratamiento", "diagnóstico", "enfermedad", "medicina",
+           "fiebre", "dolor", "presión arterial", "hipertensión", "diabetes"],
+    'hi': ["लक्षण", "उपचार", "निदान", "रोग", "दवा",
+           "बुखार", "दर्द", "रक्तचाप", "उच्च रक्तचाप", "मधुमेह"],
+    'fr': ["symptôme", "traitement", "diagnostic", "maladie", "médecine",
+           "fièvre", "douleur", "pression artérielle", "hypertension", "diabète"]
+}
+
+class MedicalQARetrievalModel:
+    def __init__(self, data_path="data/processed_medquad_qa.csv"):
+        self.data_path = data_path
+        self.df = None
+        self.vectorizer = TfidfVectorizer(
+            ngram_range=(1, 3),
+            max_features=50000,
+            stop_words='english'
+        )
+        self.question_vector = None
+        self.model_dir = "model"
+        Path(self.model_dir).mkdir(exist_ok=True)
+        self.translator = GoogleTranslator()
+
+        self._load_data()
+        self._build_vectorizer()
+
+    def _load_data(self):
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"Data file not found: {self.data_path}")
+
+        print(f"Loading data from {self.data_path} for retrieval model...")
+        self.df = pd.read_csv(self.data_path)
+
+        if self.df.empty:
+            raise ValueError("Data file is empty")
+
+        if 'lang' not in self.df.columns:
+            self.df['lang'] = 'en'
+
+        self.df['question_clean'] = self.df.apply(
+            lambda row: self._clean_text(row['question'], row['lang']), axis=1
+        )
+        print(f"Loaded {len(self.df)} Q&A pairs.")
+
+    def _clean_text(self, text, lang='en'):
+        if not isinstance(text, str):
+            return ""
+        text = text.lower()
+        if lang == 'hi':
+            text = re.sub(r'[^\u0900-\u097F\s.]', '', text)
+        else:
+            text = re.sub(r'[^\u0041-\u007A\u00C0-\u017F\s.]', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def _build_vectorizer(self):
+        print("Building tf-idf vectorizer...")
+        self.question_vector = self.vectorizer.fit_transform(self.df['question_clean'])
+        print("TF-IDF vectorizer built successfully")
+
+    def detect_language(self, text):
+        if not text.strip():
+            return 'en'
+        try:
+            lang = detect(text)
+            if lang in SUPPORTED_LANGUAGES:
+                return lang
+            text_lower = text.lower()
+            for lang_code, terms in MEDICAL_TERMS.items():
+                if any(term in text_lower for term in terms):
+                    return lang_code
+        except Exception as e:
+            print(f"Language detection error: {e}")
+        return 'en'
+
+    def translate_text(self, text, src, dest):
+        """Translate long texts using deep_translator with chunking."""
+        if src == dest or not text.strip():
+            return text
+
+        try:
+            chunks = [text[i:i + 450] for i in range(0, len(text), 450)]
+            translator = GoogleTranslator(source=src, target=dest)
+            translated_chunks = [translator.translate(chunk) for chunk in chunks]
+            final_translation = ' '.join(translated_chunks)
+            print(f"Translated from {src} to {dest}: {final_translation}")
+            return final_translation
+        except Exception as e:
+            print(f"Translation failed: {e}")
+            return text
+
+
+    def get_answer(self, user_query, top_k=1):
+        user_lang = self.detect_language(user_query)
+        print(f"Detected language: {user_lang}")
+
+        en_query = self.translate_text(user_query, user_lang, 'en') if user_lang != 'en' else user_query
+        print(f"Query (en): {en_query}")
+
+        cleaned_query = self._clean_text(en_query, 'en')
+        if not cleaned_query:
+            fallback = "Please ask a valid medical question."
+            return [{"answer": self.translate_text(fallback, 'en', user_lang), "similarity_score": 0.0}], user_lang
+
+        query_vector = self.vectorizer.transform([cleaned_query])
+        similarities = cosine_similarity(query_vector, self.question_vector).flatten()
+        top_k_indices = similarities.argsort()[-top_k:][::-1]
+
+        for idx in top_k_indices:
+            score = similarities[idx]
+            row = self.df.iloc[idx]
+
+            # Ensure we only translate clean English answers
+            if row['lang'] != 'en':
+                continue  # skip non-English sources for better translations
+
+            if score > 0.3:
+                answer = row['answer']
+                answer_translated = self.translate_text(answer, 'en', user_lang) if user_lang != 'en' else answer
+                return [{"answer": answer_translated, "similarity_score": float(score)}], user_lang
+
+        fallback = "I couldn't find a relevant answer. Try rephrasing."
+        return [{"answer": self.translate_text(fallback, 'en', user_lang), "similarity_score": 0.0}], user_lang
+
+    def save_model(self, path=None):
+        if not path:
+            path = os.path.join(self.model_dir, "retrieval_model.pkl")
+        model_data = {
+            'vectorizer': self.vectorizer,
+            'question_vector': self.question_vector,
+            'df': self.df
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(model_data, f)
+        print(f"Model saved to {path}")
+        return path
+
+    @classmethod
+    def load_model(cls, path="model/retrieval_model.pkl"):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Model file not found: {path}")
+        with open(path, 'rb') as f:
+            model_data = pickle.load(f)
+
+        model = cls.__new__(cls)
+        model.vectorizer = model_data['vectorizer']
+        model.question_vector = model_data['question_vector']
+        model.df = model_data['df']
+        model.model_dir = os.path.dirname(path)
+        model.translator = GoogleTranslator()
+
+        print(f"Model loaded from {path}")
+        return model
+
+# For testing
+if __name__ == "__main__":
+    model = MedicalQARetrievalModel()
+    queries = [
+        "what are symptoms of diabetes",                    # English
+        "cuáles son los síntomas de la diabetes",           # Spanish
+        "मधुमेह के लक्षण क्या हैं",                         # Hindi
+        "quels sont les symptômes du diabète",             # French
+        "कैंसर के लक्षण क्या हैं"                          # Hindi (test fallback)
+    ]
+    for q in queries:
+        res, lang = model.get_answer(q)
+        print(f"\nQuery ({lang}): {q}")
+        print(f"✅ Answer: {res[0]['answer']}")
+        print(f"Similarity Score: {res[0]['similarity_score']}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##  ye complete medical chatbot ka code hai
+
+# import pandas as pd
+# from sklearn.feature_extraction.text import TfidfVectorizer
+# from sklearn.metrics.pairwise import cosine_similarity
+# import os
+# import re
+# import spacy
+# import pickle
+# from pathlib import Path
+# from .language_utils import LanguageProcessor  # Import the language processor
+#
+#
+# def clean_text(text):
+#     if not isinstance(text, str):
+#         return ""
+#     text = text.lower()
+#     text = re.sub(r'[^a-z0-9.\s]', '', text)
+#     text = re.sub(r'\s+', ' ', text).strip()
+#     return text
+#
+#
+# class MedicalQARetrievalModel:
+#     def __init__(self, data_path="data/processed_medquad_qa.csv"):
+#         self.data_path = data_path
+#         self.df = None
+#         self.vectorizer = TfidfVectorizer(
+#             ngram_range=(1, 3),
+#             max_features=50000,
+#             stop_words='english'
+#         )
+#         self.question_vector = None
+#         self.nlp_models = {}  # Store spaCy models for each language
+#         self.model_dir = "model"
+#         self.language_processor = LanguageProcessor()  # Initialize language processor
+#
+#         # Create model directory if not exists
+#         Path(self.model_dir).mkdir(exist_ok=True)
+#
+#         self._load_data()
+#         self._load_ner_models()
+#         self._build_vectorizer()
+#
+#     def _load_data(self):
+#         if not os.path.exists(self.data_path):
+#             raise FileNotFoundError(
+#                 f"Data file not found: {self.data_path}\nPlease ensure data_loaders.py was run successfully.")
+#
+#         print(f"Loading data from {self.data_path} for retrieval model...")
+#         self.df = pd.read_csv(self.data_path)
+#
+#         if self.df.empty:
+#             raise ValueError(f"Data file is empty: {self.data_path}")
+#
+#         self.df['question'] = self.df['question'].astype(str).apply(clean_text)
+#         print(f"Loaded {len(self.df)} Q&A pairs.")
+#
+#     def _load_ner_models(self):
+#         print("Loading spaCy models for supported languages...")
+#         # Load English model
+#         try:
+#             self.nlp_models['en'] = spacy.load("en_core_web_sm")
+#             print("Loaded English spaCy model")
+#         except Exception as e:
+#             print(f"Error loading English spaCy model: {e}")
+#             print("Please run: python -m spacy download en_core_web_sm")
+#             raise
+#
+#         # Load other models with fallback to English
+#         for lang in ['es', 'fr', 'hi']:
+#             try:
+#                 if lang == 'hi':
+#                     self.nlp_models[lang] = spacy.load("xx_ent_wiki_sm")
+#                 else:
+#                     self.nlp_models[lang] = spacy.load(f"{lang}_core_news_sm")
+#                 print(f"Loaded {lang} spaCy model")
+#             except:
+#                 print(f"{lang} model not available, using English as fallback")
+#                 self.nlp_models[lang] = self.nlp_models['en']
+#
+#     def _build_vectorizer(self):
+#         print("Building tf-idf vectorizer...")
+#         self.question_vector = self.vectorizer.fit_transform(self.df['question'])
+#         print("TF-IDF vectorizer built successfully")
+#
+#     def get_answer(self, user_query, top_k=3):
+#         # Detect language
+#         user_lang = self.language_processor.detect_language(user_query)
+#
+#         # Translate to English for processing
+#         en_query = self.language_processor.translate_to_english(user_query)
+#
+#         # Clean English query
+#         cleaned_query = clean_text(en_query)
+#         if not cleaned_query:
+#             no_answer = self.language_processor.get_cultural_response('no_answer', user_lang)
+#             return [{
+#                 "question": "",
+#                 "answer": no_answer,
+#                 "similarity_score": 0.0
+#             }], user_lang
+#
+#         # Vectorize and find matches
+#         query_vector = self.vectorizer.transform([cleaned_query])
+#         similarities = cosine_similarity(query_vector, self.question_vector).flatten()
+#         top_k_indices = similarities.argsort()[-top_k:][::-1]
+#
+#         results = []
+#         for i in top_k_indices:
+#             score = similarities[i]
+#             if score > 0.1:
+#                 answer = self.df.loc[i, 'answer']
+#                 # Translate answer to user's language
+#                 translated_answer = self.language_processor.translate_to_target(answer, user_lang)
+#
+#                 results.append({
+#                     "question": self.df.loc[i, 'question'],
+#                     "answer": translated_answer,
+#                     "similarity_score": float(score)
+#                 })
+#
+#                 print(f"[DEBUG] User Lang: {user_lang}")
+#                 print(f"[DEBUG] Original Answer: {answer[:100]}")
+#                 print(f"[DEBUG] Translated Answer: {translated_answer[:100]}")
+#
+#         if not results:
+#             no_answer = self.language_processor.get_cultural_response('no_answer', user_lang)
+#             return [{
+#                 "question": "",
+#                 "answer": no_answer,
+#                 "similarity_score": 0.0
+#             }], user_lang
+#
+#         return results, user_lang
+#
+#     # Model persistence methods
+#     def save_model(self, path=None):
+#         if not path:
+#             path = os.path.join(self.model_dir, "retrieval_model.pkl")
+#
+#         model_data = {
+#             'vectorizer': self.vectorizer,
+#             'question_vector': self.question_vector,
+#             'df': self.df
+#         }
+#
+#         with open(path, 'wb') as f:
+#             pickle.dump(model_data, f)
+#
+#         print(f"Model saved successfully to {path}")
+#         return path
+#
+#     @classmethod
+#     def load_model(cls, path="model/retrieval_model.pkl"):
+#         if not os.path.exists(path):
+#             raise FileNotFoundError(f"Model file not found: {path}")
+#
+#         with open(path, 'rb') as f:
+#             model_data = pickle.load(f)
+#
+#         # Create a minimal instance
+#         model = cls.__new__(cls)
+#
+#         # Initialize required attributes
+#         model.nlp_models = {}
+#         model.language_processor = LanguageProcessor()
+#         model.model_dir = os.path.dirname(path)
+#
+#         # Load saved components
+#         model.vectorizer = model_data['vectorizer']
+#         model.question_vector = model_data['question_vector']
+#         model.df = model_data['df']
+#
+#         # Now load the NER models
+#         model._load_ner_models()
+#
+#         print(f"Model loaded successfully from {path}")
+#         return model
+#
